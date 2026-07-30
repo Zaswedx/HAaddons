@@ -4,6 +4,11 @@ import time
 import asyncio
 import telnetlib
 import re
+import uuid
+import traceback
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 share_dir = '/share'
 
@@ -29,8 +34,414 @@ def checksum(input_hex):
         return None
 
 
+class CloudLightController:
+    def __init__(self, config, device_list=None):
+        self.enabled = config.get('cloud_light_enabled', False)
+        self.verbose = config.get('cloud_verbose_log', True)
+        self.auth_url = config.get('cloud_auth_url', 'https://biz.ruvie.co.kr:4000/oauth/authorize')
+        self.base_url = config.get('cloud_base_url', 'https://api.ruvie.co.kr:4100')
+        self.command_endpoint = config.get('cloud_command_endpoint', '/v1/command/')
+        self.gateways_endpoint = config.get('cloud_gateways_endpoint', '/v1/gateways')
+        self.gateway_detail_endpoint = config.get('cloud_gateway_detail_endpoint', '/v1/gateways/{gateway_no}')
+        self.client_id = config.get('cloud_client_id', '')
+        self.client_secret = config.get('cloud_client_secret', '')
+        self.username = config.get('cloud_username', '')
+        self.password = config.get('cloud_password', '')
+        self.device_uuid = config.get('cloud_dvc_uuid', '')
+        self.device_os = config.get('cloud_dvc_os', 'AND')
+        self.app_version = config.get('cloud_app_version', '0.0.0.1')
+        self.timeout = int(config.get('cloud_timeout', 10))
+        self.refresh_margin = int(config.get('cloud_refresh_margin', 60))
+
+        self.token_path = share_dir + '/cwbs_cloud_token.json'
+        self.mapping_path = share_dir + '/cwbs_cloud_lights.json'
+        self.client_path = share_dir + '/cwbs_cloud_client.json'
+        self._token = None
+        self._mapping = {}
+        self._device_list = device_list or {}
+        self._rs485_light_count = self._extract_rs485_light_count(self._device_list)
+
+    async def initialize(self):
+        if not self.enabled:
+            log('[CLOUD] disabled (cloud_light_enabled=false)')
+            return
+        self._vlog('initialize start')
+        await self._ensure_device_uuid()
+        await self._load_token()
+        if self._token:
+            self._vlog('loaded cached token')
+        else:
+            self._vlog('no cached token')
+        await self._load_mapping()
+        self._vlog(f'loaded mapping size={len(self._mapping)}')
+        if not self._mapping or self._needs_remap():
+            await self.discover_lights()
+        self._vlog('initialize done')
+
+    async def set_light(self, idx, onoff):
+        if not self.enabled:
+            log(f'[CLOUD] set_light skipped (disabled): Light{idx} {onoff}')
+            return False
+        self._vlog(f'set_light start: idx={idx} onoff={onoff}')
+        if not await self.ensure_token():
+            log(f'[CLOUD] set_light aborted: ensure_token failed (Light{idx})')
+            return False
+        if not self._mapping:
+            self._vlog('mapping empty; trying discover_lights()')
+            await self.discover_lights()
+        light = self._mapping.get(str(idx))
+        if not light:
+            log(f'[CLOUD] light mapping not found for Light{idx}')
+            self._vlog(f'available mapping keys: {list(self._mapping.keys())[:20]}')
+            return False
+        self._vlog(
+            f"mapped Light{idx} -> gateway={light.get('gateway_no')} "
+            f"root={light.get('root_uuid')} sub={light.get('sub_uuid')}"
+        )
+
+        payload = {
+            "commands": {
+                "cgpCommand": [
+                    {
+                        "gatewayNo": light['gateway_no'],
+                        "cgp": {
+                            "command": "set",
+                            "object": {
+                                "rootUuid": light['root_uuid'],
+                                "rootDevice": light.get('root_device', 'switch'),
+                                "subDevice": [
+                                    {
+                                        "value": "on" if onoff == 'ON' else "off",
+                                        "funcCommand": light.get('func_command', 'report'),
+                                        "sort": light.get('sort', 'switchBinary'),
+                                        "subUuid": light['sub_uuid'],
+                                        "type": light.get('type', 'readWrite'),
+                                    }
+                                ],
+                            },
+                        },
+                    }
+                ]
+            }
+        }
+        ok = await self._post_with_auth(self.command_endpoint, payload)
+        if ok:
+            log(f'[CLOUD] Light{idx} -> {onoff} success')
+        else:
+            log(f'[CLOUD] Light{idx} -> {onoff} failed')
+        return ok
+
+    async def discover_lights(self):
+        if not self.enabled:
+            return {}
+        if not await self.ensure_token():
+            log('[CLOUD] discover_lights failed: ensure_token failed')
+            return {}
+
+        self._vlog(f'discover_lights GET {self.gateways_endpoint}')
+        gateways = await self._get_with_auth(self.gateways_endpoint)
+        if not gateways:
+            log('[CLOUD] discover_lights failed: gateways response empty')
+            return {}
+
+        items = gateways.get('gateways', {}).get('gateway', [])
+        self._vlog(f'discover_lights gateways count={len(items)}')
+        found = []
+        for gw in items:
+            gw_no = gw.get('gatewayNo')
+            if not gw_no:
+                continue
+            self._vlog(f'discover_lights gateway detail: {gw_no}')
+            detail = await self._get_with_auth(self.gateway_detail_endpoint.format(gateway_no=gw_no))
+            if not detail:
+                log(f'[CLOUD] gateway detail failed: {gw_no}')
+                continue
+            objects = detail.get('gateway', {}).get('devices', {}).get('object', [])
+            for obj in objects:
+                if obj.get('commaxDevice') != 'light':
+                    continue
+                sub = (obj.get('subDevice') or [{}])[0]
+                root_uuid = obj.get('rootUuid')
+                sub_uuid = sub.get('subUuid')
+                if not root_uuid or not sub_uuid:
+                    continue
+                found.append({
+                    'gateway_no': gw_no,
+                    'root_uuid': root_uuid,
+                    'sub_uuid': sub_uuid,
+                    'root_device': obj.get('rootDevice', 'switch'),
+                    'sort': sub.get('sort', 'switchBinary'),
+                    'type': sub.get('type', 'readWrite'),
+                    'func_command': sub.get('funcCommand', 'report'),
+                    'nickname': obj.get('nickname', ''),
+                    'device_number': str(obj.get('deviceNumber', '')),
+                })
+
+        found.sort(
+            key=lambda x: (
+                int(x.get('device_number')) if str(x.get('device_number', '')).isdigit() else 9999,
+                x.get('nickname', ''),
+            )
+        )
+        if self._rs485_light_count > 0:
+            found = found[:self._rs485_light_count]
+            self._vlog(f'apply RS485 light count: {self._rs485_light_count}')
+        else:
+            self._vlog('RS485 Light.Number not found or 0; fallback to all discovered cloud lights')
+        mapping = {}
+        for i, item in enumerate(found, start=1):
+            mapping[str(i)] = item
+        self._mapping = mapping
+        await self._save_mapping()
+        log(f'[CLOUD] discovered and mapped {len(mapping)} light(s)')
+        if mapping:
+            sample = {k: {'nickname': v.get('nickname', ''), 'device_number': v.get('device_number', '')}
+                      for k, v in list(mapping.items())[:5]}
+            self._vlog(f'mapping sample: {sample}')
+            if self._rs485_light_count > 0 and len(mapping) < self._rs485_light_count:
+                log(
+                    f"[CLOUD] warning: RS485 Light.Number={self._rs485_light_count}, "
+                    f"but cloud discovered {len(mapping)} light(s)"
+                )
+        return mapping
+
+    def _extract_rs485_light_count(self, device_list):
+        try:
+            return int((device_list or {}).get('Light', {}).get('Number', 0))
+        except Exception:
+            return 0
+
+    def _needs_remap(self):
+        if self._rs485_light_count <= 0:
+            return False
+        if len(self._mapping) != self._rs485_light_count:
+            self._vlog(
+                f"mapping size mismatch; remap needed "
+                f"(mapping={len(self._mapping)} rs485={self._rs485_light_count})"
+            )
+            return True
+        expected_keys = {str(i) for i in range(1, self._rs485_light_count + 1)}
+        actual_keys = set(self._mapping.keys())
+        if actual_keys != expected_keys:
+            self._vlog('mapping key mismatch; remap needed')
+            return True
+        return False
+
+    async def ensure_token(self):
+        if not self.enabled:
+            return False
+        now = int(time.time())
+        if self._token and self._token.get('access_expires_at', 0) - self.refresh_margin > now:
+            self._vlog('ensure_token: cached access token is valid')
+            return True
+        if self._token and self._token.get('refresh_token'):
+            self._vlog('ensure_token: trying refresh token')
+            if await self._refresh(self._token['refresh_token']):
+                self._vlog('ensure_token: refresh success')
+                return True
+            log('[CLOUD] token refresh failed, fallback login')
+        else:
+            self._vlog('ensure_token: no refresh token, trying login')
+        return await self._login()
+
+    async def _login(self):
+        params = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'password',
+            'username': self.username,
+            'password': self.password,
+        }
+        self._vlog('login request start')
+        data = await self._http_get(self.auth_url, params=params, headers=self._auth_headers())
+        if not data:
+            log('[CLOUD] login failed: empty response')
+            return False
+        return await self._apply_token(data)
+
+    async def _refresh(self, refresh_token):
+        params = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+        }
+        self._vlog('refresh request start')
+        data = await self._http_get(self.auth_url, params=params, headers=self._auth_headers())
+        if not data:
+            log('[CLOUD] refresh failed: empty response')
+            return False
+        return await self._apply_token(data)
+
+    async def _apply_token(self, data):
+        access_token = data.get('access_token')
+        refresh_token = data.get('refresh_token')
+        expires_in = data.get('expires_in') or data.get('expire_in')
+        if not access_token or not refresh_token or not expires_in:
+            log('[CLOUD] token parse failed: missing token fields')
+            return False
+        try:
+            expires_at = int(time.time()) + int(expires_in)
+        except Exception:
+            return False
+        self._token = {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'access_expires_at': expires_at,
+        }
+        await self._save_token()
+        self._vlog(f'token applied: expires_at={expires_at}')
+        return True
+
+    def _auth_headers(self):
+        return {
+            'cmx-dvc-uuid': self.device_uuid,
+            'cmx-dvc-os': self.device_os,
+            'cmx-app-version': self.app_version,
+        }
+
+    def _join_url(self, path):
+        return self.base_url.rstrip('/') + path
+
+    async def _get_with_auth(self, path):
+        if not self._token:
+            self._vlog(f'GET {path} skipped: no token')
+            return None
+        headers = {'Authorization': f"Bearer {self._token['access_token']}"}
+        self._vlog(f'GET request: {path}')
+        data = await self._http_get(self._join_url(path), headers=headers)
+        if data is not None:
+            return data
+        self._vlog(f'GET failed once; retry with login: {path}')
+        if await self._login():
+            headers = {'Authorization': f"Bearer {self._token['access_token']}"}
+            return await self._http_get(self._join_url(path), headers=headers)
+        return None
+
+    async def _post_with_auth(self, path, payload):
+        if not self._token:
+            self._vlog(f'POST {path} skipped: no token')
+            return False
+        headers = {'Authorization': f"Bearer {self._token['access_token']}", 'Content-Type': 'application/json'}
+        self._vlog(f'POST request: {path}')
+        data = await self._http_post(self._join_url(path), payload=payload, headers=headers)
+        if data is not None:
+            return True
+        self._vlog(f'POST failed once; retry with login: {path}')
+        if await self._login():
+            headers = {'Authorization': f"Bearer {self._token['access_token']}", 'Content-Type': 'application/json'}
+            data = await self._http_post(self._join_url(path), payload=payload, headers=headers)
+            return data is not None
+        return False
+
+    async def _http_get(self, url, params=None, headers=None):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._http_get_sync(url, params, headers))
+
+    async def _http_post(self, url, payload=None, headers=None):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: self._http_post_sync(url, payload, headers))
+
+    def _http_get_sync(self, url, params=None, headers=None):
+        if params:
+            query = urlencode(params)
+            sep = '&' if '?' in url else '?'
+            url = f'{url}{sep}{query}'
+        req = Request(url=url, method='GET', headers=headers or {})
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode('utf-8')
+                self._vlog(f'GET ok: {url} status={getattr(resp, "status", "na")}')
+                return json.loads(raw) if raw else {}
+        except HTTPError as err:
+            body = ''
+            try:
+                body = err.read().decode('utf-8')
+            except Exception:
+                pass
+            log(f'[CLOUD] GET HTTPError: {url} status={err.code} body={body[:300]}')
+            return None
+        except (URLError, TimeoutError, ValueError, OSError) as err:
+            log(f'[CLOUD] GET failed: {url} ({err})')
+            return None
+
+    def _http_post_sync(self, url, payload=None, headers=None):
+        body = json.dumps(payload or {}).encode('utf-8')
+        req = Request(url=url, data=body, method='POST', headers=headers or {})
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode('utf-8')
+                self._vlog(f'POST ok: {url} status={getattr(resp, "status", "na")}')
+                return json.loads(raw) if raw else {}
+        except HTTPError as err:
+            body = ''
+            try:
+                body = err.read().decode('utf-8')
+            except Exception:
+                pass
+            log(f'[CLOUD] POST HTTPError: {url} status={err.code} body={body[:300]}')
+            return None
+        except (URLError, TimeoutError, ValueError, OSError) as err:
+            log(f'[CLOUD] POST failed: {url} ({err})')
+            return None
+
+    async def _load_token(self):
+        loop = asyncio.get_running_loop()
+        self._token = await loop.run_in_executor(None, self._load_json_file, self.token_path, None)
+
+    async def _save_token(self):
+        if not self._token:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._save_json_file, self.token_path, self._token)
+
+    async def _load_mapping(self):
+        loop = asyncio.get_running_loop()
+        self._mapping = await loop.run_in_executor(None, self._load_json_file, self.mapping_path, {})
+
+    async def _save_mapping(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._save_json_file, self.mapping_path, self._mapping)
+
+    async def _ensure_device_uuid(self):
+        if self.device_uuid:
+            self._vlog(f'use configured dvc_uuid: {self.device_uuid}')
+            return
+        loop = asyncio.get_running_loop()
+        meta = await loop.run_in_executor(None, self._load_json_file, self.client_path, {})
+        dvc_uuid = meta.get('dvc_uuid')
+        if not dvc_uuid:
+            dvc_uuid = str(uuid.uuid4()).upper()
+            meta['dvc_uuid'] = dvc_uuid
+            await loop.run_in_executor(None, self._save_json_file, self.client_path, meta)
+            log(f'[CLOUD] generated dvc_uuid: {dvc_uuid}')
+        self.device_uuid = dvc_uuid
+        self._vlog(f'use generated dvc_uuid: {dvc_uuid}')
+
+    def _vlog(self, message):
+        if self.verbose:
+            log(f'[CLOUD][VERBOSE] {message}')
+
+    @staticmethod
+    def _load_json_file(path, default):
+        try:
+            with open(path, 'r', encoding='utf-8') as file:
+                data = json.load(file)
+                if isinstance(data, dict):
+                    return data
+                return default
+        except Exception:
+            return default
+
+    @staticmethod
+    def _save_json_file(path, data):
+        with open(path, 'w', encoding='utf-8') as file:
+            json.dump(data, file, ensure_ascii=True, indent=2)
+
+
 def find_device(config):
     HA_TOPIC = config['mqtt_TOPIC']
+    found_device_file = config.get('found_device_file', 'cwbs_found_device.json')
 
     with open('/apps/cwbs_devinfo.json') as file:
         dev_info = json.load(file)
@@ -90,9 +501,10 @@ def find_device(config):
         log('-------------------')
     log('======================================')
     log('기기의 숫자만 변경하였습니다. 상태 패킷은 직접 수정하여야 합니다.')
-    with open(share_dir + '/cwbs_found_device.json', 'w', encoding='utf-8') as make_file:
+    save_path = f'{share_dir}/{found_device_file}'
+    with open(save_path, 'w', encoding='utf-8') as make_file:
         json.dump(dev_info, make_file, indent="\t")
-        log('기기리스트 저장 중 : /share/cowbs_found_device.json')
+        log(f'기기리스트 저장 중 : {save_path}')
         log('파일을 수정하고 싶은 경우 종료 후 다시 시작하세요.')
     return dev_info
 
@@ -100,12 +512,15 @@ def find_device(config):
 def do_work(config, device_list):
     HA_TOPIC = config['mqtt_TOPIC']
     STATE_TOPIC = HA_TOPIC + '/{}/{}/state'
+    DISCOVERY_PREFIX = config.get('discovery_prefix', 'cwbs')
 
     debug = config['DEBUG']
     mqtt_log = config['mqtt_log']
     elfin_log = config['elfin_log']
 
-    mqtt_client = mqtt.Client(HA_TOPIC)
+    mqtt_client_id = config.get('mqtt_client_id', f'{HA_TOPIC}_client')
+    mqtt_client = mqtt.Client(mqtt_client_id)
+    cloud_light = CloudLightController(config, device_list)
 
     def pad(value):
         value = int(value)
@@ -190,13 +605,23 @@ def do_work(config, device_list):
     async def recv_from_HA(topics, value):
         if mqtt_log:
             log('[LOG] HA ->> : {} -> {}'.format('/'.join(topics), value))
+        elif topics[0] == HA_TOPIC and topics[-1] == 'command':
+            log(f'[CMD] {"/".join(topics)} -> {value}')
 
         device = ''.join(re.findall('[a-zA-Z]', topics[1]))
 
         if device in DEVICE_LISTS:
             key = topics[1] + topics[2]
-            idx = int(''.join(re.findall('\d', topics[1])))
+            idx = int(''.join(re.findall(r'\d', topics[1])))
             value = 'ON' if value == 'heat' else value.upper()
+
+            if device == 'Light' and topics[2] == 'power' and value in ['ON', 'OFF']:
+                log(f'[CLOUD] intercepted Light command: device={topics[1]} value={value}')
+                ok = await cloud_light.set_light(idx, value)
+                if ok:
+                    await update_state(device, idx - 1, value)
+                    return
+                log(f'[CLOUD] fallback to RS485 queue for {topics[1]}')
 
             if device == 'Thermo':
                 curTemp = HOMESTATE.get(topics[1] + 'curTemp')
@@ -258,8 +683,20 @@ def do_work(config, device_list):
         if elfin_log:
             log('[SIGNAL] receved: {}'.format(raw_data))
 
-        cors = [recv_from_elfin(raw_data[k:k + 16]) for k in range(0, len(raw_data), 16) if raw_data[k:k + 16] == checksum(raw_data[k:k + 16])]
-        await asyncio.gather(*cors)
+        packets = [
+            raw_data[k:k + 16]
+            for k in range(0, len(raw_data), 16)
+            if raw_data[k:k + 16] == checksum(raw_data[k:k + 16])
+        ]
+        cors = [recv_from_elfin(packet) for packet in packets]
+        results = await asyncio.gather(*cors, return_exceptions=True)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                if debug:
+                    log(
+                        f"[DEBUG] recv_from_elfin error: packet={packets[i]} "
+                        f"type={type(result).__name__} repr={result!r}"
+                    )
 
     async def recv_from_elfin(data):
         COLLECTDATA['LastRecv'] = time.time_ns()
@@ -275,6 +712,10 @@ def do_work(config, device_list):
                     break
 
             device_name = prefix_list.get(data[:2])
+            if not device_name:
+                if debug:
+                    log(f"[DEBUG] Unknown packet prefix: {data[:2]} raw={data}")
+                return
             if device_name == 'Thermo':
                 curTnum = device_list['Thermo']['curTemp']
                 setTnum = device_list['Thermo']['setTemp']
@@ -394,23 +835,28 @@ def do_work(config, device_list):
         if rc == 0:
             log("MQTT 접속 완료..")
             client.subscribe([(HA_TOPIC + '/#', 0), (ELFIN_TOPIC + '/recv', 0), (ELFIN_TOPIC + '/send', 1)])
+            log(f"[MQTT] subscribed: {HA_TOPIC}/#, {ELFIN_TOPIC}/recv, {ELFIN_TOPIC}/send")
+            log(f"[CLOUD] enabled={config.get('cloud_light_enabled')} topic={HA_TOPIC}")
             if 'EV' in DEVICE_LISTS:
                 asyncio.run(update_state('EV', 0, 'OFF'))
             # MQTT discover
             for device in DEVICE_LISTS:
                 for idx in range(len(DEVICE_LISTS[device]['list'])):
-                    config_topic = f'homeassistant/{DEVICE_LISTS[device]["type"]}/commax_{device.lower()}{idx + 1}/config'
+                    config_topic = (
+                        f'homeassistant/{DEVICE_LISTS[device]["type"]}/'
+                        f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}/config'
+                    )
                     if DEVICE_LISTS[device]["type"] == "climate":
                         payload = {
                             "device": {
-                                "identifiers": "cwbs",
-                                "name": "코맥스 월패드 by Saram",
+                                "identifiers": DISCOVERY_PREFIX,
+                                "name": "코맥스 월패드 by Zaswedx",
                                 "manufacturer": "commax",
                             },
                             "device_class": DEVICE_LISTS[device]["type"],
                             "name": f'{device}{idx+1}',
-                            "object_id": f'cwbs_{device.lower()}{idx + 1}',
-                            "unique_id": f'cwbs_{device.lower()}{idx + 1}',
+                            "object_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}',
+                            "unique_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}',
                             "entity_category": 'config',
                             "mode_cmd_t": f"{HA_TOPIC}/{device}{idx+1}/power/command",
                             "mode_stat_t": f"{HA_TOPIC}/{device}{idx+1}/power/state",
@@ -424,45 +870,62 @@ def do_work(config, device_list):
                             "mode_state_template": "{% set modes = {'OFF': 'off', 'ON': 'heat'} %} {{modes[value] if value in modes.keys() else 'off'}}"
                                 }
                     else:
-                        payload = {
-                            "device": {
-                                "identifiers": "cwbs",
-                                "name": "코맥스 월패드 by Saram",
-                                "manufacturer": "commax",
-                            },
-                            "~": f'{HA_TOPIC}/{device}{idx + 1}/power',
-                            "device_class": DEVICE_LISTS[device]["type"],
-                            "name": f'{device}{idx+1}',
-                            "object_id": f'cwbs_{device.lower()}{idx + 1}',
-                            "unique_id": f'cwbs_{device.lower()}{idx + 1}',
-                            "cmd_t": "~/command",
-                            "stat_t": "~/state"}
-                        if device == "Outlet":
-                            payload["device_class"] = 'outlet'
-                            payload["entity_category"] = 'diagnostic'
+                        if DEVICE_LISTS[device]["type"] == "button":
+                            press_payload = "OFF" if device == "Gas" else "ON"
+                            payload = {
+                                "device": {
+                                    "identifiers": DISCOVERY_PREFIX,
+                                    "name": "코맥스 월패드 by Zaswedx",
+                                    "manufacturer": "commax",
+                                },
+                                "name": f'{device}{idx+1}',
+                                "object_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}',
+                                "unique_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}',
+                                "command_topic": f"{HA_TOPIC}/{device}{idx + 1}/power/command",
+                                "payload_press": press_payload
+                            }
+                        else:
+                            payload = {
+                                "device": {
+                                    "identifiers": DISCOVERY_PREFIX,
+                                    "name": "코맥스 월패드 by Zaswedx",
+                                    "manufacturer": "commax",
+                                },
+                                "~": f'{HA_TOPIC}/{device}{idx + 1}/power',
+                                "device_class": DEVICE_LISTS[device]["type"],
+                                "name": f'{device}{idx+1}',
+                                "object_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}',
+                                "unique_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}',
+                                "cmd_t": "~/command",
+                                "stat_t": "~/state"}
+                            if device == "Outlet":
+                                payload["device_class"] = 'outlet'
+                                payload["entity_category"] = 'diagnostic'
 
                     log(config_topic)
                     log(json.dumps(payload))
-                    mqtt_client.publish(config_topic, json.dumps(payload))
+                    mqtt_client.publish(config_topic, json.dumps(payload), retain=True)
                     if device == "Outlet":
-                        config_topic = f'homeassistant/sensor/cwbs_{device}{idx + 1}_watt/config'
+                        config_topic = (
+                            f'homeassistant/sensor/{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}_watt/config'
+                        )
                         payload = {
                             "device": {
-                                "identifiers": "cwbs",
-                                "name": "코맥스 월패드 by Saram",
+                                "identifiers": DISCOVERY_PREFIX,
+                                "name": "코맥스 월패드 by Zaswedx",
                                 "manufacturer": "commax",
                             },
                             "device_class": 'energy',
                             "name": f'{device}{idx + 1} Watt',
-                            "object_id": f'cwbs_{device.lower()}{idx + 1}_watt',
-                            "unique_id": f'cwbs_{device.lower()}{idx + 1}_watt',
+                            "object_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}_watt',
+                            "unique_id": f'{DISCOVERY_PREFIX}_{device.lower()}{idx + 1}_watt',
                             "entity_category": 'diagnostic',
                             "stat_t": f'{HA_TOPIC}/{device}{idx + 1}/watt/state',
                             "unit_of_measurement": "W"
                         }
                         log(config_topic)
                         log(json.dumps(payload))
-                        mqtt_client.publish(config_topic, json.dumps(payload))
+                        mqtt_client.publish(config_topic, json.dumps(payload), retain=True)
 
         else:
             errcode = {1: 'Connection refused - incorrect protocol version',
@@ -476,11 +939,19 @@ def do_work(config, device_list):
         topics = msg.topic.split('/')
         try:
             if topics[0] == HA_TOPIC and topics[-1] == 'command':
-                asyncio.run(recv_from_HA(topics, msg.payload.decode('utf-8')))
+                payload = msg.payload.decode('utf-8')
+                log(f"[MQTT] command received: topic={msg.topic} payload={payload}")
+                asyncio.run(recv_from_HA(topics, payload))
             elif topics[0] == ELFIN_TOPIC and topics[-1] == 'recv':
                 asyncio.run(slice_raw_data(msg.payload.hex().upper()))
-        except:
-            pass
+        except Exception as err:
+            log(
+                f"[ERROR] on_message failed: topic={msg.topic} "
+                f"type={type(err).__name__} repr={err!r}"
+            )
+            if debug:
+                log(traceback.format_exc())
+            return
 
     async def send_to_elfin():
         while True:
@@ -530,18 +1001,26 @@ def do_work(config, device_list):
     mqtt_client.loop_start()
 
     loop = asyncio.get_event_loop()
+    if config.get('cloud_light_enabled'):
+        try:
+            loop.run_until_complete(cloud_light.initialize())
+            log('[CLOUD] controller initialized')
+        except Exception as err:
+            log(f'[CLOUD] initialize error: {err}')
     loop.run_until_complete(send_to_elfin())
     loop.close()
     mqtt_client.loop_stop()
 
 
 if __name__ == '__main__':
-    log("'Commax Wallpad by Saram'을 시작합니다.")
+    log("'Commax Wallpad by Zaswedx'을 시작합니다.")
     with open('/data/options.json') as file:
         CONFIG = json.load(file)
+    found_device_file = CONFIG.get('found_device_file', 'cwbs_found_device.json')
+    found_device_path = f'{share_dir}/{found_device_file}'
     try:
-        with open(share_dir + '/cwbs_found_device.json') as file:
-            log('기기 정보 파일을 찾음: /share/cwbs_found_device.json')
+        with open(found_device_path) as file:
+            log(f'기기 정보 파일을 찾음: {found_device_path}')
             OPTION = json.load(file)
     except IOError:
         log('기기 정보 파일이 없습니다. mqtt에 접속하여 기기를 찾습니다.')
