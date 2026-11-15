@@ -1101,5 +1101,10 @@ if __name__ == '__main__':
         log('기기 정보 파일이 없습니다. mqtt에 접속하여 기기를 찾습니다.')
         OPTION = find_device(CONFIG)
 
+    # 자동 탐색이 난방 패킷을 못 찾아 Number=0이 저장된 경우를 옵션으로 덮어씀
+    if int(CONFIG.get('thermo_number', 0) or 0) > 0:
+        OPTION['Thermo']['Number'] = int(CONFIG['thermo_number'])
+        log(f"Thermo.Number를 옵션값으로 설정: {OPTION['Thermo']['Number']}")
+
     while True:
         do_work(CONFIG, OPTION)

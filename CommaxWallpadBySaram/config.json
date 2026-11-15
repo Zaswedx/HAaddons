@@ -1,6 +1,6 @@
 {
   "name": "COMMAX Wallpad by Zaswedx",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "slug": "cwbs_cloud",
   "url": "https://github.com/kimtc99/HAaddons",
   "description": "mqtt 통신을 활용한 코맥스 월패드 컨트롤러",
@@ -24,6 +24,7 @@
     "elfin_server": "192.168.x.x",
     "elfin_id": "admin",
     "elfin_password": "elfin_password",
+    "thermo_number": 0,
     "cloud_light_enabled": false,
     "cloud_verbose_log": true,
     "cloud_username": "",
@@ -54,6 +55,7 @@
     "elfin_server": "str",
     "elfin_id": "str",
     "elfin_password": "str",
+    "thermo_number": "int?",
     "cloud_light_enabled": "bool",
     "cloud_verbose_log": "bool",
     "cloud_username": "str",
