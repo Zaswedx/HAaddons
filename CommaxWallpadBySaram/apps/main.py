@@ -60,6 +60,9 @@ class CloudLightController:
         self._mapping = {}
         self._device_list = device_list or {}
         self._rs485_light_count = self._extract_rs485_light_count(self._device_list)
+        self.boiler_path = share_dir + '/cwbs_cloud_boilers.json'
+        self._boilers = {}
+        self._rs485_thermo_count = int((device_list or {}).get('Thermo', {}).get('Number', 0) or 0)
 
     async def initialize(self):
         if not self.enabled:
@@ -76,7 +79,67 @@ class CloudLightController:
         self._vlog(f'loaded mapping size={len(self._mapping)}')
         if not self._mapping or self._needs_remap():
             await self.discover_lights()
+        loop = asyncio.get_running_loop()
+        self._boilers = await loop.run_in_executor(None, self._load_json_file, self.boiler_path, {})
+        if self._rs485_thermo_count and len(self._boilers) != self._rs485_thermo_count:
+            await self.discover_boilers()
         self._vlog('initialize done')
+
+    async def discover_boilers(self):
+        # shortcut: maps by cloud deviceNumber order == RS485 room number; re-check if rooms are renumbered
+        if not await self.ensure_token():
+            return {}
+        gateways = await self._get_with_auth(self.gateways_endpoint)
+        found = []
+        for gw in (gateways or {}).get('gateways', {}).get('gateway', []):
+            gw_no = gw.get('gatewayNo')
+            detail = gw_no and await self._get_with_auth(self.gateway_detail_endpoint.format(gateway_no=gw_no))
+            for obj in ((detail or {}).get('gateway', {}).get('devices', {}).get('object', [])):
+                if obj.get('commaxDevice') != 'boiler' or not obj.get('rootUuid'):
+                    continue
+                subs = {s['sort']: {'sub_uuid': s.get('subUuid'), 'func_command': s.get('funcCommand', 'report'),
+                                    'type': s.get('type', 'readWrite')}
+                        for s in obj.get('subDevice', []) if s.get('sort') and s.get('subUuid')}
+                found.append({'gateway_no': gw_no, 'root_uuid': obj['rootUuid'],
+                              'nickname': obj.get('nickname', ''), 'subs': subs,
+                              'device_number': str(obj.get('deviceNumber', ''))})
+        found.sort(key=lambda x: int(x['device_number']) if x['device_number'].isdigit() else 9999)
+        self._boilers = {str(i): b for i, b in enumerate(found, start=1)}
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._save_json_file, self.boiler_path, self._boilers)
+        log(f'[CLOUD] discovered and mapped {len(self._boilers)} boiler(s)')
+        if self._rs485_thermo_count and len(self._boilers) != self._rs485_thermo_count:
+            log(f'[CLOUD] warning: RS485 Thermo.Number={self._rs485_thermo_count} but cloud has {len(self._boilers)}')
+        return self._boilers
+
+    async def set_boiler(self, idx, sort, value):
+        """sort: 'thermostatMode' (heat/off) or 'thermostatSetpoint' (5-45)."""
+        if not self.enabled or sort not in ('thermostatMode', 'thermostatSetpoint'):
+            return False
+        if sort == 'thermostatMode' and value not in ('heat', 'off'):
+            return False
+        if sort == 'thermostatSetpoint':
+            if not str(value).isdigit() or not 5 <= int(value) <= 45:
+                log(f'[CLOUD] Thermo{idx} setpoint out of range: {value}')
+                return False
+        if not await self.ensure_token():
+            return False
+        if not self._boilers:
+            await self.discover_boilers()
+        boiler = self._boilers.get(str(idx))
+        sub = (boiler or {}).get('subs', {}).get(sort)
+        if not sub:
+            log(f'[CLOUD] boiler mapping not found for Thermo{idx}/{sort}')
+            return False
+        payload = {"commands": {"cgpCommand": [{
+            "gatewayNo": boiler['gateway_no'],
+            "cgp": {"command": "set", "object": {
+                "rootUuid": boiler['root_uuid'], "rootDevice": "thermostat",
+                "subDevice": [{"value": str(value), "funcCommand": sub['func_command'], "sort": sort,
+                               "subUuid": sub['sub_uuid'], "type": sub['type']}]}}}]}}
+        ok = await self._post_with_auth(self.command_endpoint, payload)
+        log(f"[CLOUD] Thermo{idx} {sort}={value} {'success' if ok else 'failed'}")
+        return ok
 
     async def set_light(self, idx, onoff):
         if not self.enabled:
@@ -626,6 +689,18 @@ def do_work(config, device_list):
             if device == 'Thermo':
                 curTemp = HOMESTATE.get(topics[1] + 'curTemp')
                 setTemp = HOMESTATE.get(topics[1] + 'setTemp')
+                if topics[2] in ('power', 'setTemp') and value not in ('', None):
+                    try:
+                        cloud_args = ('thermostatMode', 'heat' if value == 'ON' else 'off') if topics[2] == 'power' \
+                            else ('thermostatSetpoint', str(int(float(value))))
+                    except ValueError:
+                        cloud_args = None
+                    if cloud_args and await cloud_light.set_boiler(idx, *cloud_args):
+                        # RS485 state packets (82..) confirm and refresh shortly; publish only what is certain now
+                        if topics[2] == 'power':
+                            await update_state(device, idx - 1, value)
+                        return
+                    log(f'[CLOUD] fallback to RS485 queue for {topics[1]}/{topics[2]}')
                 if topics[2] == 'power':
                     sendcmd = make_hex_temp(idx - 1, curTemp, setTemp, value)
                     recvcmd = [make_hex_temp(idx - 1, curTemp, setTemp, 'state' + value)]
